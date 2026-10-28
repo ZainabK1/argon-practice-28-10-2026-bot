@@ -1,0 +1,41 @@
+name: Argon v9.2 Intraday 15m Sniper Practice Bot
+
+on:
+  schedule:
+    # Runs every 15 minutes Monday-Friday across 13:00 to 21:45 UTC (covers both GMT/BST & EDT/EST).
+    # The Python script's NY clock gate automatically sleeps outside 09:30-16:05 NY time.
+    - cron: '0,15,30,45 13-21 * * 1-5'
+  workflow_dispatch: # Adds a "Run workflow" button so you can trigger it manually anytime
+
+# Prevents two 15-minute runs from overlapping if GitHub queues a runner late
+concurrency:
+  group: argon-intraday-practice-sniper
+  cancel-in-progress: false
+
+jobs:
+  execute-intraday-scalps:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Bot Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11 with Pip Cache
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install numpy pandas yfinance requests
+
+      - name: Run 15-Minute Order-Book Sniper Cycle
+        env:
+          ARGON_BROKER_MODE: ${{ secrets.ARGON_BROKER_MODE }}
+          ARGON_LIVE_EXECUTION: ${{ secrets.ARGON_LIVE_EXECUTION }}
+          TRADING212_API_KEY: ${{ secrets.TRADING212_API_KEY }}
+          TRADING212_API_SECRET: ${{ secrets.TRADING212_API_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: python argon_uk_live_bot.py
