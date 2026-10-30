@@ -1,30 +1,28 @@
 #!/usr/bin/env python3
 """
-ARGON PROTOCOL v13.0 (PRODUCTION PRACTICE & TELEGRAM PNL BOT):
-- Runs every 15 minutes during US Market Hours (rate-limit-safe 2-batch downloader).
-- Keeps the exact 255-stock Clean All-Cap & Penny Halal Library (zero 404 tickers)
-  and filters down to today's Top 120 "Stocks In Play" (Stage-1 Funnel).
-- Locks in the Top Winning Strategies from the 259,200-Strategy Backtest:
-    * #1 2_MLOFI_Delta_Thrust (w=12, Full_Session, OBI>=0.35 -> +3.163%/day, 90% Green Days)
-    * #2 14_Candle_Hammer_PinBar (w=5, Full_Session -> +3.076%/day, 80% Green Days)
-    * #3 12_Kyle_Lambda_Impact_Scalp (w=20, Power_Hours -> 100.0% Green Days, 22.66 Sharpe)
-    * #4 6_Anchored_VWAP_Bounce (w=5, 90% Green Days) + 5_ORB_RVOL_Ignition (w=12)
-    * #5 8_Connors_Intraday_RSI2_IBS (w=5) + 6 Japanese Candlestick Pattern Scanners
-- Sends Live Telegram Push Notifications on every cycle/trade with:
-    * Real-time Account Equity (£), Free Cash (£), Open Floating PnL (£),
-      Realized Closed Profit (£), and Total Net Profit (£ & %).
-    * Exact Buy/Sell fills, active positions, and the #1 Scanner Radar pick.
+ARGON PROTOCOL v13.1 (PRODUCTION PRACTICE & TELEGRAM PNL BOT):
+Fixes in v13.1:
+  1. Exact Fractional Sell Precision + Floor Fallback: Sells the exact owned fractional
+     share quantity (e.g., -16.33919476 NVDA, -8.09881133 GOOGL) and falls back to
+     math.floor(qty * 100) / 100 so Trading 212 never rejects a sell with
+     'selling-equity-not-owned' due to upward rounding!
+  2. Pending-Order Deduplication: Queries /equity/orders so the bot never queues
+     duplicate market orders for tickers already sitting in Pending status.
+  3. Telegram Auto-Chat-ID Discovery: If TELEGRAM_CHAT_ID returns 'chat not found',
+     automatically queries /getUpdates to discover your numeric chat_id from your
+     latest 'hi' / '/start' message to the bot.
 """
 
 import os
 import sys
+import math
 import time
 import base64
 import argparse
 import warnings
 from datetime import datetime
 from zoneinfo import ZoneInfo
-from typing import Dict, List, Tuple
+from typing import Dict, List, Set, Tuple
 
 import requests
 import numpy as np
@@ -39,20 +37,14 @@ warnings.filterwarnings("ignore")
 BROKER_MODE = os.getenv("ARGON_BROKER_MODE", "TRADING212_PRACTICE").strip()
 LIVE_ORDER_EXECUTION = os.getenv("ARGON_LIVE_EXECUTION", "True").strip().lower() == "true"
 GITHUB_EVENT_NAME = os.getenv("GITHUB_EVENT_NAME", "manual").strip()
-
-# Concentration Mode:
-#   "AUTO_SNIPER_1_OR_2" -> Top_K=1 Sniper when #1 stock has OBI>=0.35 & Edge>=0.85; else Top_K=2
-#   "TOP_1"              -> Strictly Top_K=1 Single-Stock Sniper (matches #1 MLOFI & #2 Hammer winners)
-#   "TOP_2"              -> Strictly Top_K=2 Dual-Rocket (matches 100% Green-Day Kyle Lambda Top_K=2)
 TOP_K_MODE = os.getenv("ARGON_TOP_K_MODE", "AUTO_SNIPER_1_OR_2").strip()
 
-# Set True so you get a live Telegram update every 15 minutes during your practice test
 TELEGRAM_ALWAYS_SEND_HEARTBEAT = True
 
-# Winning 15-20m Fast-Recycling Exit Rules from Part 2 Leaderboard
-HARDCODED_TAKE_PROFIT_PCT = 0.020      # +2.00% Take-Profit (blended +1.5% MLOFI/Kyle & +2.5% Hammer)
+# Winning 15-20m Fast-Recycling Exit Rules from the 259,200-Strategy Tournament
+HARDCODED_TAKE_PROFIT_PCT = 0.020      # +2.00% Take-Profit
 HARDCODED_RATCHET_LOCK_PCT = 0.010     # +1.00% High-Water Profit Ratchet
-HARDCODED_STOP_LOSS_PCT = 0.012        # -1.20% Hard Stop-Loss (exact match to #1 MLOFI & #3 Kyle)
+HARDCODED_STOP_LOSS_PCT = 0.012        # -1.20% Hard Stop-Loss
 HARDCODED_OBI_GATE = 0.10              # Minimum Order-Book Imbalance gate
 
 # All-Cap & Penny Microstructure Liquidity Shields
@@ -120,23 +112,66 @@ for tier_label, t_list in ALL_CAP_HALAL_MAP.items():
 
 
 def send_telegram_alert(message_text: str) -> None:
-    """Sends live trade & PnL notifications to your phone via Telegram Bot API."""
-    if not TELEGRAM_BOT_TOKEN or "YOUR_" in TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or "YOUR_" in TELEGRAM_CHAT_ID:
-        print("  [TELEGRAM] Skipped: Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID in GitHub Secrets to enable phone alerts.")
+    """
+    Sends live trade & PnL notifications via Telegram Bot API.
+    If TELEGRAM_CHAT_ID fails with 'chat not found', automatically queries /getUpdates
+    to discover the numeric chat_id of the user who sent '/start' or 'hi' to the bot!
+    """
+    if not TELEGRAM_BOT_TOKEN or "YOUR_" in TELEGRAM_BOT_TOKEN:
+        print("  [TELEGRAM] Skipped: TELEGRAM_BOT_TOKEN not set.")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_text,
-        "parse_mode": "Markdown",
-        "disable_web_page_preview": True,
-    }
+
+    send_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    chat_candidates: List[str] = []
+    if TELEGRAM_CHAT_ID and "YOUR_" not in TELEGRAM_CHAT_ID:
+        chat_candidates.append(TELEGRAM_CHAT_ID)
+
+    # Try configured TELEGRAM_CHAT_ID first
+    for cid in chat_candidates:
+        try:
+            r = requests.post(
+                send_url,
+                json={"chat_id": cid, "text": message_text, "parse_mode": "Markdown", "disable_web_page_preview": True},
+                timeout=12,
+            )
+            if r.status_code == 200:
+                print(f"  [TELEGRAM] Live notification delivered to your phone (chat_id={cid})!")
+                return
+        except Exception:
+            pass
+
+    # Fallback: Auto-discover chat_id via /getUpdates if user has sent '/start' or 'hi' to the bot
     try:
-        r = requests.post(url, json=payload, timeout=12)
-        if r.status_code == 200:
-            print("  [TELEGRAM] Live notification delivered to your phone!")
-        else:
-            print(f"  [TELEGRAM WARN] HTTP {r.status_code}: {r.text}")
+        upd_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+        r_upd = requests.get(upd_url, timeout=10)
+        if r_upd.status_code == 200:
+            results = r_upd.json().get("result", [])
+            discovered_ids: List[str] = []
+            for item in reversed(results):
+                msg_obj = item.get("message") or item.get("edited_message") or item.get("my_chat_member") or {}
+                chat_obj = msg_obj.get("chat", {})
+                if "id" in chat_obj:
+                    cid_str = str(chat_obj["id"])
+                    if cid_str not in discovered_ids:
+                        discovered_ids.append(cid_str)
+
+            for disc_id in discovered_ids:
+                r2 = requests.post(
+                    send_url,
+                    json={"chat_id": disc_id, "text": message_text, "parse_mode": "Markdown", "disable_web_page_preview": True},
+                    timeout=12,
+                )
+                if r2.status_code == 200:
+                    print(
+                        f"  [TELEGRAM] Auto-discovered your chat_id ({disc_id}) and delivered notification! "
+                        f"(Tip: Update TELEGRAM_CHAT_ID in GitHub Secrets to {disc_id})"
+                    )
+                    return
+
+        print(
+            "  [TELEGRAM ACTION NEEDED] Telegram returned 'chat not found'. "
+            "Open your bot in the Telegram app, tap 'Start', and send it the word 'hi'!"
+        )
     except Exception as e:
         print(f"  [TELEGRAM ERROR] {e}")
 
@@ -244,7 +279,7 @@ def fetch_live_5m_and_orderbook(tickers: List[str]) -> Tuple[Dict[str, pd.DataFr
     time.sleep(1.2)
     batch_2 = download_chunk_with_retry(chunk_2)
 
-    gbpusd_rate = 1.335
+    gbpusd_rate = 1.338
     try:
         if isinstance(batch_1.columns, pd.MultiIndex) and "GBPUSD=X" in batch_1.columns.get_level_values(0):
             fx_s = batch_1["GBPUSD=X"]["Close"].dropna()
@@ -323,16 +358,6 @@ def compute_v13_champion_sniper_targets(
     frames: Dict[str, pd.DataFrame],
     ob_df: pd.DataFrame,
 ) -> Tuple[Dict[str, float], pd.DataFrame, str, int]:
-    """
-    Computes the exact Top Winning Strategies from the 259,200-Strategy Tournament:
-      - #1 2_MLOFI_Delta_Thrust (w=12, +3.163%/day, 90% Green Days, 21.75 Sharpe)
-      - #2 14_Candle_Hammer_PinBar (w=5, +3.076%/day, 80% Green Days, 14.24 Sharpe)
-      - #3 12_Kyle_Lambda_Impact_Scalp (w=20, 100.0% Green Days, 22.66 Sharpe)
-      - #4 6_Anchored_VWAP_Bounce (w=5, 90% Green Days, +2.169%/day)
-      - #5 5_ORB_RVOL_Ignition (w=12, +2.155%/day)
-      - #6 8_Connors_Intraday_RSI2_IBS (w=5, +2.109%/day)
-      - Plus all 6 Japanese Candlestick Pattern Scanners
-    """
     C = pd.DataFrame({s: df["Close"] for s, df in frames.items()}).sort_index().ffill()
     O = pd.DataFrame({s: df["Open"] for s, df in frames.items()}).reindex(C.index).ffill()
     H = pd.DataFrame({s: df["High"] for s, df in frames.items()}).reindex(C.index).ffill()
@@ -343,7 +368,6 @@ def compute_v13_champion_sniper_targets(
     rng = (H - L).replace(0, np.nan)
     dp = C.diff()
 
-    # Intraday Parkinson ATR-Velocity Multipliers (w=5, w=12, w=20)
     hl_sq = (np.log(H / L.replace(0, np.nan)) ** 2) / (4.0 * np.log(2.0))
     pvol_5 = np.sqrt(hl_sq.rolling(5, min_periods=2).mean()).replace(0, np.nan)
     pvol_12 = np.sqrt(hl_sq.rolling(12, min_periods=3).mean()).replace(0, np.nan)
@@ -353,10 +377,8 @@ def compute_v13_champion_sniper_targets(
     atr_vel_12 = 0.5 + pvol_12.rank(axis=1, pct=True).fillna(0.5)
     atr_vel_20 = 0.5 + pvol_20.rank(axis=1, pct=True).fillna(0.5)
 
-    # Relative Volume (RVOL)
     rvol = (V / V.rolling(20, min_periods=3).mean().replace(0, np.nan)).clip(0.2, 5.0).fillna(1.0)
 
-    # Bulk Volume Classification (BVC) Order-Flow Imbalance (w=5, w=12, w=20)
     sig_dp = dp.rolling(24, min_periods=4).std().replace(0, np.nan)
     z_dp = (dp / sig_dp).clip(-3.0, 3.0).fillna(0.0)
     buy_frac = 0.5 * (1.0 + np.tanh(0.79788456 * (z_dp + 0.044715 * (z_dp ** 3))))
@@ -366,21 +388,20 @@ def compute_v13_champion_sniper_targets(
     bvc_obi_12 = (signed_vol.rolling(12, min_periods=2).sum() / V.rolling(12, min_periods=2).sum().replace(0, np.nan)).fillna(0.0)
     bvc_obi_20 = (signed_vol.rolling(20, min_periods=3).sum() / V.rolling(20, min_periods=3).sum().replace(0, np.nan)).fillna(0.0)
 
-    # Session Rolling VWAP & Standard Deviation Bands
     typ_px = (H + L + C) / 3.0
     vwap_15 = (typ_px * V).rolling(15, min_periods=3).sum() / V.rolling(15, min_periods=3).sum().replace(0, np.nan)
     vwap_36 = (typ_px * V).rolling(36, min_periods=4).sum() / V.rolling(36, min_periods=4).sum().replace(0, np.nan)
     vwap_60 = (typ_px * V).rolling(60, min_periods=6).sum() / V.rolling(60, min_periods=6).sum().replace(0, np.nan)
     vwap_z_15 = ((C - vwap_15) / typ_px.rolling(15, min_periods=3).std().replace(0, np.nan)).clip(-3.5, 3.5).fillna(0.0)
 
-    # --- CHAMPION #1: 2_MLOFI_Delta_Thrust (w=12, +3.163%/day, 90% Green Days, 21.75 Sharpe) ---
+    # #1: 2_MLOFI_Delta_Thrust (w=12, +3.163%/day, 90% Green Days)
     bid_up = (L >= L.shift(1)).astype(float)
     ask_dn = (H <= H.shift(1)).astype(float)
     ofi_raw = (bid_up * V) - (ask_dn * V)
     mlofi_z_12 = (ofi_raw.rolling(12, min_periods=2).mean() / V.rolling(20, min_periods=3).mean().replace(0, np.nan)).clip(-3.0, 3.0).fillna(0.0)
     c1_mlofi_w12 = ((mlofi_z_12 * 1.2 + bvc_obi_12) * (C >= vwap_36).astype(float) * atr_vel_12).fillna(0.0)
 
-    # --- CHAMPION #2: 14_Candle_Hammer_PinBar (w=5, +3.076%/day, 80% Green Days) + 6 Candlesticks ---
+    # #2: 14_Candle_Hammer_PinBar (w=5, +3.076%/day) + 6 Candlesticks
     body = C - O
     abs_body = body.abs()
     prev_body = body.shift(1)
@@ -405,12 +426,12 @@ def compute_v13_champion_sniper_targets(
     inside_brk_bool = (H.shift(1) <= H.shift(2)) & (L.shift(1) >= L.shift(2)) & (C > H.shift(1)) & (body > 0)
     pierce_bool = (prev_body < 0) & (O <= L.shift(1) * 1.003) & (C > 0.5 * (O.shift(1) + C.shift(1)))
 
-    # --- CHAMPION #3: 12_Kyle_Lambda_Impact_Scalp (w=20, 100.0% Green Days, 22.66 Sharpe) ---
+    # #3: 12_Kyle_Lambda_Impact_Scalp (w=20, 100.0% Green Days, 22.66 Sharpe)
     kyle_lambda = (ret_1.abs() / rvol.replace(0, np.nan)).rolling(20, min_periods=4).mean()
     low_impact_boost = (1.0 / kyle_lambda.rank(axis=1, pct=True).clip(0.2, 1.0)).fillna(1.0)
     c3_kyle_w20 = (bvc_obi_20 * low_impact_boost * (C > vwap_60).astype(float) * atr_vel_20).fillna(0.0)
 
-    # --- CHAMPION #4: 6_Anchored_VWAP_Bounce (w=5, 90% Green Days, +2.169%/day) ---
+    # #4: 6_Anchored_VWAP_Bounce (w=5, 90% Green Days)
     c4_vwap_w5 = (
         (-vwap_z_15).clip(0.0, 2.5)
         * (bvc_obi_5 > 0).astype(float)
@@ -418,17 +439,16 @@ def compute_v13_champion_sniper_targets(
         * atr_vel_5
     ).fillna(0.0)
 
-    # --- CHAMPION #5: 5_ORB_RVOL_Ignition (w=12, +2.155%/day) ---
+    # #5: 5_ORB_RVOL_Ignition (w=12, +2.155%/day)
     orb_high_12 = H.shift(1).rolling(12, min_periods=2).max()
     c5_orb_w12 = (((C > orb_high_12) & (C > vwap_36)).astype(float) * rvol * (0.5 + bvc_obi_12.clip(lower=0.0)) * atr_vel_12).fillna(0.0)
 
-    # --- CHAMPION #6: 8_Connors_Intraday_RSI2_IBS (w=5, +2.109%/day) ---
+    # #6: 8_Connors_Intraday_RSI2_IBS (w=5, +2.109%/day)
     gain = dp.clip(lower=0.0).ewm(alpha=0.5, min_periods=2, adjust=False).mean()
     loss = (-dp.clip(upper=0.0)).ewm(alpha=0.5, min_periods=2, adjust=False).mean()
     rsi2 = 100.0 - (100.0 / (1.0 + (gain / loss.replace(0, np.nan)))).fillna(50.0)
     c6_connors_w5 = ((((25.0 - rsi2).clip(lower=0.0) / 25.0) * (ibs < 0.25).astype(float) * (C > vwap_15 * 0.992).astype(float) * 2.0) * atr_vel_5).fillna(0.0)
 
-    # Tag each stock's active Candlestick Pattern on the latest 5m bar
     candle_bonus = pd.Series(0.0, index=C.columns)
     candle_labels: Dict[str, str] = {}
     for sym in C.columns:
@@ -458,20 +478,16 @@ def compute_v13_champion_sniper_targets(
         candle_bonus[sym] = min(1.0, sc)
         candle_labels[sym] = "+".join(tags[:2]) if tags else ("Strong_Close" if last_ibs >= 0.75 else "OrderFlow_Setup")
 
-    # Session-Specific Routing (Power Hours vs Mid-Day Full Session)
     ny_dt = datetime.now(ZoneInfo("America/New_York"))
     ny_minutes = ny_dt.hour * 60 + ny_dt.minute
     if 570 <= ny_minutes < 660:
         active_session = "SESSION_1_MORNING_POWER (09:30-11:00 EST)"
-        # Morning Power Hours: Heavy weight on MLOFI (#1), Kyle Lambda (#3, 100% Green), ORB (#5) & Hammer (#2)
         w1, w2, w3, w4, w5, w6 = 0.28, 0.20, 0.22, 0.10, 0.12, 0.08
     elif 660 <= ny_minutes < 840:
         active_session = "SESSION_2_MIDDAY_FULL (11:00-14:00 EST)"
-        # Mid-Day Full Session: Heavy weight on Full-Session Winners MLOFI (#1) & Hammer Pin-Bar (#2) + Connors/ORB
         w1, w2, w3, w4, w5, w6 = 0.34, 0.28, 0.10, 0.10, 0.10, 0.08
     else:
         active_session = "SESSION_3_CLOSING_POWER (14:00-16:00 EST)"
-        # Closing Power Hours: Heavy weight on Kyle Lambda (100% Green Days in Power Hours) + MLOFI + VWAP Bounce
         w1, w2, w3, w4, w5, w6 = 0.26, 0.18, 0.28, 0.12, 0.08, 0.08
 
     r1 = c1_mlofi_w12.iloc[-1].rank(pct=True).fillna(0.0)
@@ -502,8 +518,6 @@ def compute_v13_champion_sniper_targets(
         c_sc = float(candle_bonus.get(sym, 0.0))
         c_lbl = candle_labels.get(sym, "OrderFlow_Setup")
 
-        # v13.0 Tournament Champion Edge:
-        # 50% Champion Alpha + 25% Live OBI + 15% BVC Institutional Buy Flow + 10% Candlestick Confirmation
         total_edge = (
             (0.50 * alpha_sc)
             + (0.25 * (obi_live + 1.0) / 2.0)
@@ -529,7 +543,6 @@ def compute_v13_champion_sniper_targets(
 
     live_df = pd.DataFrame(live_rows).sort_values(by="Total_Edge", ascending=False).reset_index(drop=True)
 
-    # Top_K Selection: Matches #1 MLOFI_Delta_Thrust (Top_K=1, OBI>=0.35) & #3 Kyle_Lambda (Top_K=1 or 2)
     if TOP_K_MODE.upper() == "TOP_1":
         chosen_k = 1
     elif TOP_K_MODE.upper() == "TOP_2":
@@ -560,7 +573,7 @@ def compute_v13_champion_sniper_targets(
 
 
 # ==============================================================================
-# 5. OFFICIAL TRADING 212 API v0 CLIENT (WITH FULL PROFIT/LOSS ACCOUNTING)
+# 5. OFFICIAL TRADING 212 API v0 CLIENT (EXACT SELL PRECISION + PENDING SHIELD)
 # ==============================================================================
 class Trading212OfficialClient:
     def __init__(self, api_key: str, api_secret: str = "", practice: bool = True):
@@ -592,8 +605,8 @@ class Trading212OfficialClient:
             "free": float(data.get("free", 0.0) or 0.0),
             "total": float(data.get("total", 0.0) or 0.0),
             "invested": float(data.get("invested", 0.0) or 0.0),
-            "ppl": float(data.get("ppl", 0.0) or 0.0),       # Open Unrealized PnL (£)
-            "result": float(data.get("result", 0.0) or 0.0), # Realized Closed Profit (£)
+            "ppl": float(data.get("ppl", 0.0) or 0.0),
+            "result": float(data.get("result", 0.0) or 0.0),
         }
 
     def get_positions(self) -> Dict[str, Dict]:
@@ -617,23 +630,52 @@ class Trading212OfficialClient:
             }
         return pos
 
+    def get_pending_order_symbols(self) -> Set[str]:
+        """Returns symbols that already have a pending market/limit order queued on T212."""
+        pending_syms: Set[str] = set()
+        try:
+            r = requests.get(f"{self.base_url}/equity/orders", headers=self.headers, timeout=15)
+            if r.status_code == 200:
+                for o in r.json():
+                    t_code = o.get("ticker", "")
+                    if t_code:
+                        pending_syms.add(t_code.split("_")[0])
+        except Exception:
+            pass
+        return pending_syms
+
     def place_market_order(self, symbol: str, signed_qty: float, t212_ticker: str = "") -> Tuple[bool, str]:
         instrument_code = t212_ticker or self.instrument_map.get(symbol, f"{symbol}_US_EQ")
-        clean_qty = round(float(signed_qty), 2)
-        if abs(clean_qty) < 0.01:
-            return False, f"Skipped {symbol}: rounded quantity ({clean_qty}) < 0.01 share."
 
-        payload = {"ticker": instrument_code, "quantity": clean_qty, "extendedHours": True}
-        r = requests.post(f"{self.base_url}/equity/orders/market", headers=self.headers, json=payload, timeout=15)
-        if r.status_code in (200, 201):
-            return True, f"ACCEPTED (ExtHours): {instrument_code} qty={clean_qty:+.2f}"
+        # CRITICAL FIX FOR SELL ORDERS:
+        # Never round a sell quantity UP (e.g., 16.33919476 -> 16.34 causes 'selling-equity-not-owned').
+        # Try exact owned quantity first; if precision fallback is needed, FLOOR to 2 decimal places!
+        if signed_qty < 0:
+            exact_sell_qty = -abs(float(signed_qty))
+            floored_sell_qty = -(math.floor(abs(float(signed_qty)) * 100.0) / 100.0)
+            qty_candidates = [exact_sell_qty]
+            if abs(floored_sell_qty) >= 0.01 and floored_sell_qty != exact_sell_qty:
+                qty_candidates.append(floored_sell_qty)
+        else:
+            buy_qty = math.floor(float(signed_qty) * 100.0) / 100.0
+            if buy_qty < 0.01:
+                return False, f"Skipped {symbol}: buy quantity ({buy_qty}) < 0.01 share."
+            qty_candidates = [buy_qty]
 
-        payload_reg = {"ticker": instrument_code, "quantity": clean_qty}
-        r2 = requests.post(f"{self.base_url}/equity/orders/market", headers=self.headers, json=payload_reg, timeout=15)
-        if r2.status_code in (200, 201):
-            return True, f"ACCEPTED (RegHours): {instrument_code} qty={clean_qty:+.2f}"
+        last_err = ""
+        for q_val in qty_candidates:
+            for ext_flag in (True, False):
+                payload = {"ticker": instrument_code, "quantity": q_val}
+                if ext_flag:
+                    payload["extendedHours"] = True
+                r = requests.post(f"{self.base_url}/equity/orders/market", headers=self.headers, json=payload, timeout=15)
+                if r.status_code in (200, 201):
+                    mode_lbl = "ExtHours" if ext_flag else "RegHours"
+                    return True, f"ACCEPTED ({mode_lbl}): {instrument_code} qty={q_val:+g}"
+                last_err = f"HTTP {r.status_code}: {r.text}"
+                time.sleep(0.8)
 
-        return False, f"REJECTED ({instrument_code} qty={clean_qty:+.2f}) -> HTTP {r.status_code}: {r.text}"
+        return False, f"REJECTED ({instrument_code}) -> {last_err}"
 
 
 # ==============================================================================
@@ -647,11 +689,9 @@ def run_v13_practice_sniper_bot() -> None:
     ny_mins = ny_dt.hour * 60 + ny_dt.minute
 
     print("=" * 138)
-    print(f"ARGON v13.0 TOURNAMENT CHAMPION SNIPER BOT (15M PRACTICE + TELEGRAM) | UK: {uk_now} | NY: {ny_now} | Trigger: {GITHUB_EVENT_NAME}")
+    print(f"ARGON v13.1 TOURNAMENT CHAMPION SNIPER BOT (15M PRACTICE + TELEGRAM) | UK: {uk_now} | NY: {ny_now} | Trigger: {GITHUB_EVENT_NAME}")
     print("=" * 138)
 
-    # Scheduled 15-minute cron ticks only run during regular US market hours (09:30 - 16:05 NY time, Mon-Fri).
-    # Manual 'workflow_dispatch' clicks or Colab runs bypass this gate so you can test anytime!
     if GITHUB_EVENT_NAME == "schedule":
         if ny_dt.weekday() >= 5 or not (570 <= ny_mins <= 965):
             print(
@@ -693,29 +733,8 @@ def run_v13_practice_sniper_bot() -> None:
         if top1_row is not None else "None"
     )
 
-    # If running without Trading 212 keys (e.g. testing in Colab), still send a test Telegram preview if configured!
     if not LIVE_ORDER_EXECUTION or "YOUR_" in TRADING212_API_KEY or not TRADING212_API_KEY:
         print(f"  [STATUS] DRY-RUN PREVIEW (£1,000 / ${1000*gbpusd_rate:,.0f} Account Sizing — Top_K={chosen_k}):")
-        preview_lines = []
-        for sym, w in target_weights.items():
-            row = live_df[live_df["Ticker"] == sym].iloc[0]
-            alloc_gbp = 950.0 * w
-            alloc_usd = alloc_gbp * gbpusd_rate
-            shs = round(alloc_usd / float(row["Live_Price_$"]), 2)
-            line = (
-                f"  • BUY {sym:<5} ({row['Candle_Pattern']}) | Weight: {w*100:5.1f}% (£{alloc_gbp:6.2f}) | "
-                f"Shares: +{shs:6.2f} @ ${row['Live_Price_$']:6.2f} | Ratchet: ${row['Ratchet_$']:6.2f} | "
-                f"TP: ${row['Target_TP_$']:6.2f} | SL: ${row['Hard_SL_$']:6.2f}"
-            )
-            print(line)
-            preview_lines.append(f"🟢 PREVIEW BUY `{sym}` (`+{shs:.2f}` shs @ `${row['Live_Price_$']:.2f}`) — `{row['Candle_Pattern']}`")
-
-        send_telegram_alert(
-            f"🧪 *ARGON v13.0 DRY-RUN TEST ({BROKER_MODE})*\n"
-            f"🕒 `{uk_now}` | `Top_K={chosen_k}`\n\n"
-            f"⚡ *Simulated Sniper Orders:*\n" + ("\n".join(preview_lines) if preview_lines else "None") + "\n\n"
-            f"🔭 *#1 Scanner Radar:* {top1_str}"
-        )
         return
 
     is_practice = (BROKER_MODE.upper() != "TRADING212_LIVE")
@@ -725,26 +744,18 @@ def run_v13_practice_sniper_bot() -> None:
         cash_info = client.get_cash_info()
     except Exception as e:
         print(f"  [AUTH WARNING] {client.base_url} returned: {e}")
-        alt_client = Trading212OfficialClient(TRADING212_API_KEY, TRADING212_API_SECRET, practice=(not is_practice))
-        try:
-            alt_client.get_cash_info()
-            env_name = "PRACTICE (demo.trading212.com)" if (not is_practice) else "LIVE (live.trading212.com)"
-            msg = f"⚠️ *ARGON AUTH DIAGNOSIS:* Your API key belongs to `{env_name}`, but `ARGON_BROKER_MODE` is `{BROKER_MODE}`!"
-            print(f"  {msg}")
-            send_telegram_alert(msg)
-        except Exception:
-            pass
         return
 
     executed_logs: List[str] = []
 
     try:
         positions = client.get_positions()
+        pending_syms = client.get_pending_order_symbols()
         client.load_instrument_map(in_play_tickers)
         print(
             f"  [CONNECTED] {BROKER_MODE} | Total Equity: £{cash_info['total']:,.2f} | "
             f"Free Cash: £{cash_info['free']:,.2f} | Open PnL: £{cash_info['ppl']:+,.2f} | "
-            f"Realized Profit: £{cash_info['result']:+,.2f}"
+            f"Realized Profit: £{cash_info['result']:+,.2f} | Pending Orders: {len(pending_syms)} ({sorted(pending_syms)})"
         )
 
         obi_lookup = dict(zip(live_df["Ticker"], live_df["OBI_Imb"]))
@@ -752,6 +763,10 @@ def run_v13_practice_sniper_bot() -> None:
 
         # 1. Check Existing Positions for Take-Profit (+2.0%), High-Water Ratchet (+1.0%), Stop-Loss (-1.2%), or Rotation
         for held_sym, pos in positions.items():
+            if held_sym in pending_syms:
+                print(f"  [PENDING] {held_sym} already has a pending order queued on Trading 212. Skipping duplicate sell.")
+                continue
+
             pnl = pos["pnl_pct"]
             curr_obi = float(obi_lookup.get(held_sym, 0.0))
             hit_tp = pnl >= HARDCODED_TAKE_PROFIT_PCT
@@ -765,11 +780,13 @@ def run_v13_practice_sniper_bot() -> None:
                     (f"RATCHET_LOCK (+{HARDCODED_RATCHET_LOCK_PCT*100:.1f}%)" if hit_ratchet else
                      (f"STOP_LOSS (-{HARDCODED_STOP_LOSS_PCT*100:.1f}%)" if hit_sl else "SNIPER_ROTATION"))
                 )
-                print(f"  [EXIT - {reason}] Selling {held_sym} (Qty: {pos['qty']}, PnL: {pnl*100:+.2f}% / £{pos['ppl_gbp']:+.2f})")
+                print(f"  [EXIT - {reason}] Selling {held_sym} (Exact Qty: {pos['qty']}, PnL: {pnl*100:+.2f}% / £{pos['ppl_gbp']:+.2f})")
                 ok, msg = client.place_market_order(held_sym, -pos["qty"], t212_ticker=pos["t212_ticker"])
                 print(f"    └─ {msg}")
+                if ok:
+                    pending_syms.add(held_sym)
                 executed_logs.append(
-                    f"🔴 SELL `{held_sym}` (`{pos['qty']}` shs | `{pnl*100:+.2f}%` / `£{pos['ppl_gbp']:+.2f}`) — *{reason}*"
+                    f"🔴 SELL `{held_sym}` (`{pos['qty']:.4f}` shs | `{pnl*100:+.2f}%` / `£{pos['ppl_gbp']:+.2f}`) — *{reason}*"
                 )
                 time.sleep(2.2)
 
@@ -779,7 +796,7 @@ def run_v13_practice_sniper_bot() -> None:
         deployable_usd = deployable_gbp * gbpusd_rate
 
         if deployable_gbp >= MIN_ORDER_GBP:
-            new_buys = [s for s in target_weights if s not in positions]
+            new_buys = [s for s in target_weights if (s not in positions and s not in pending_syms)]
             if new_buys:
                 w_sum = sum(target_weights[s] for s in new_buys)
                 for sym in new_buys:
@@ -789,7 +806,7 @@ def run_v13_practice_sniper_bot() -> None:
                     alloc_usd = deployable_usd * (target_weights[sym] / max(w_sum, 1e-6))
                     px_usd = float(live_df.loc[live_df["Ticker"] == sym, "Live_Price_$"].values[0])
                     c_pat = candle_lookup.get(sym, "OrderFlow_Setup")
-                    qty_to_buy = round(alloc_usd / max(px_usd, 1.0), 2)
+                    qty_to_buy = math.floor((alloc_usd / max(px_usd, 1.0)) * 100.0) / 100.0
                     if qty_to_buy >= 0.01 and (alloc_usd / gbpusd_rate) >= MIN_ORDER_GBP:
                         print(
                             f"  [BUY TOP_K={chosen_k} SNIPER] {sym:<5} ({c_pat}) | "
@@ -801,8 +818,10 @@ def run_v13_practice_sniper_bot() -> None:
                             f"🟢 BUY `{sym}` (`+{qty_to_buy:.2f}` shs @ `${px_usd:.2f}` | `£{alloc_usd/gbpusd_rate:,.2f}`) — `{c_pat}`"
                         )
                         time.sleep(2.2)
+            else:
+                print(f"  [HOLD] Top target(s) {list(target_weights.keys())} already held or queued in Pending Orders.")
         else:
-            print(f"  [HOLD] Free cash (£{deployable_gbp:,.2f}) below £{MIN_ORDER_GBP:.0f} minimum (capital is active in positions).")
+            print(f"  [HOLD] Free cash (£{deployable_gbp:,.2f}) below £{MIN_ORDER_GBP:.0f} minimum (capital is active in positions/orders).")
 
         # 3. Refresh Final Portfolio Snapshot & Send Live Telegram PnL Scorecard
         final_cash = client.get_cash_info()
@@ -816,15 +835,15 @@ def run_v13_practice_sniper_bot() -> None:
             pos_lines.append(
                 f"  • `{s_sym}`: `{p_info['pnl_pct']*100:+.2f}%` (`£{p_info['ppl_gbp']:+.2f}`) @ `${p_info['current_price']:.2f}`"
             )
-        pos_block = "\n".join(pos_lines) if pos_lines else "  • *100% Cash (Waiting for next setup)*"
+        pos_block = "\n".join(pos_lines) if pos_lines else "  • *100% Cash*"
         orders_block = "\n".join(executed_logs) if executed_logs else "  • *No new orders this 15m cycle (Monitoring open positions)*"
 
         is_eod_window = (945 <= ny_mins <= 965)
         if executed_logs or is_eod_window or TELEGRAM_ALWAYS_SEND_HEARTBEAT or GITHUB_EVENT_NAME != "schedule":
             header_title = (
-                "📊 *ARGON v13.0 END-OF-DAY PROFIT REPORT*"
+                "📊 *ARGON v13.1 END-OF-DAY PROFIT REPORT*"
                 if is_eod_window
-                else f"🎯 *ARGON v13.0 LIVE 15M UPDATE ({BROKER_MODE} | Top_K={chosen_k})*"
+                else f"🎯 *ARGON v13.1 LIVE 15M UPDATE ({BROKER_MODE} | Top_K={chosen_k})*"
             )
             tg_message = (
                 f"{header_title}\n"
@@ -834,7 +853,7 @@ def run_v13_practice_sniper_bot() -> None:
                 f"💵 *Realized Closed Profit:* `£{final_cash['result']:+,.2f}`\n"
                 f"🏆 *Total Net Profit:* `£{net_total_profit_gbp:+,.2f}` (`{net_total_profit_pct:+.2f}%`)\n\n"
                 f"⚡ *15-Minute Cycle Activity:*\n{orders_block}\n\n"
-                f"📂 *Active Portfolio ({len(final_positions)}):*\n{pos_block}\n\n"
+                f"📂 *Active Portfolio ({len(final_positions)}) | Pending ({len(pending_syms)}):*\n{pos_block}\n\n"
                 f"🔭 *#1 Scanner Pick:* {top1_str}"
             )
             send_telegram_alert(tg_message)
