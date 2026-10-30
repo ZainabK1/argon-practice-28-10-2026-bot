@@ -1,15 +1,14 @@
-name: Argon v9.2 Intraday 15m Sniper Practice Bot
+name: Argon v13.0 Intraday 15m Practice & Telegram Sniper Bot
 
 on:
   schedule:
     # Runs every 15 minutes Monday-Friday across 13:00 to 21:45 UTC (covers both GMT/BST & EDT/EST).
     # The Python script's NY clock gate automatically sleeps outside 09:30-16:05 NY time.
     - cron: '0,15,30,45 13-21 * * 1-5'
-  workflow_dispatch: # Adds a "Run workflow" button so you can trigger it manually anytime
+  workflow_dispatch: # Manual button to test your Practice Account & Telegram Bot anytime!
 
-# Prevents two 15-minute runs from overlapping if GitHub queues a runner late
 concurrency:
-  group: argon-intraday-practice-sniper
+  group: argon-v13-intraday-practice-sniper
   cancel-in-progress: false
 
 jobs:
@@ -29,7 +28,7 @@ jobs:
       - name: Install Dependencies
         run: pip install numpy pandas yfinance requests
 
-      - name: Run 15-Minute Order-Book Sniper Cycle
+      - name: Run 15-Minute Order-Book & Telegram Sniper Cycle
         env:
           ARGON_BROKER_MODE: ${{ secrets.ARGON_BROKER_MODE }}
           ARGON_LIVE_EXECUTION: ${{ secrets.ARGON_LIVE_EXECUTION }}
